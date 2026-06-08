@@ -1,0 +1,197 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d background_image;
+
+uniform float texture_width = 1280.0;
+uniform float texture_height = 720.0;
+uniform float elapsed_time = 0.0;
+uniform float glass_amount = 0.94;
+uniform float distortion = 0.72;
+uniform float liquid_speed = 0.88;
+uniform float edge_glow = 0.54;
+uniform float chromatic_split = 0.44;
+uniform float highlight_strength = 0.72;
+uniform float mix_amount = 1.0;
+uniform float cloak_amount = 1.0;
+uniform float scene_through = 0.0;
+uniform float scene_through_amount = 1.0;
+uniform float mask_threshold = 0.22;
+uniform float mask_softness = 0.13;
+uniform float has_background = 0.0;
+uniform float debug_mask = 0.0;
+
+sampler_state linear_sampler {
+	Filter = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv;
+	return vert_out;
+}
+
+float hash(float2 p)
+{
+	p = frac(p * float2(123.34, 456.21));
+	p += dot(p, p + 45.32);
+	return frac(p.x * p.y);
+}
+
+float noise(float2 p)
+{
+	float2 i = floor(p);
+	float2 f = frac(p);
+	float2 u = f * f * (3.0 - 2.0 * f);
+
+	float a = hash(i);
+	float b = hash(i + float2(1.0, 0.0));
+	float c = hash(i + float2(0.0, 1.0));
+	float d = hash(i + float2(1.0, 1.0));
+
+	return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+float fbm(float2 p)
+{
+	float value = 0.0;
+	float amplitude = 0.5;
+
+	for (int i = 0; i < 4; i++) {
+		value += amplitude * noise(p);
+		p = p * 2.03 + 17.17;
+		amplitude *= 0.5;
+	}
+
+	return value;
+}
+
+float luminance(float3 color)
+{
+	return dot(color, float3(0.2126, 0.7152, 0.0722));
+}
+
+float sobel_edge(float2 uv)
+{
+	float2 px = float2(1.0 / max(texture_width, 1.0),
+			   1.0 / max(texture_height, 1.0));
+
+	float tl = luminance(image.Sample(linear_sampler, uv + px * float2(-1.0, -1.0)).rgb);
+	float t = luminance(image.Sample(linear_sampler, uv + px * float2(0.0, -1.0)).rgb);
+	float tr = luminance(image.Sample(linear_sampler, uv + px * float2(1.0, -1.0)).rgb);
+	float l = luminance(image.Sample(linear_sampler, uv + px * float2(-1.0, 0.0)).rgb);
+	float r = luminance(image.Sample(linear_sampler, uv + px * float2(1.0, 0.0)).rgb);
+	float bl = luminance(image.Sample(linear_sampler, uv + px * float2(-1.0, 1.0)).rgb);
+	float b = luminance(image.Sample(linear_sampler, uv + px * float2(0.0, 1.0)).rgb);
+	float br = luminance(image.Sample(linear_sampler, uv + px * float2(1.0, 1.0)).rgb);
+
+	float gx = (tr + 2.0 * r + br) - (tl + 2.0 * l + bl);
+	float gy = (bl + 2.0 * b + br) - (tl + 2.0 * t + tr);
+
+	return smoothstep(0.08, 0.34, sqrt(gx * gx + gy * gy));
+}
+
+float3 chromatic_sample(float2 uv, float2 offset)
+{
+	float r = image.Sample(linear_sampler, uv + offset).r;
+	float g = image.Sample(linear_sampler, uv).g;
+	float b = image.Sample(linear_sampler, uv - offset).b;
+	return float3(r, g, b);
+}
+
+float foreground_difference_mask(float2 uv, float3 source_color)
+{
+	float3 background_color = background_image.Sample(linear_sampler, uv).rgb;
+	float diff = distance(source_color, background_color);
+	float low = mask_threshold;
+	float high = mask_threshold + max(mask_softness, 0.001);
+	float mask = smoothstep(low, high, diff);
+
+	float2 px = float2(1.0 / max(texture_width, 1.0),
+			   1.0 / max(texture_height, 1.0));
+	float neighbor_diff = 0.0;
+	neighbor_diff += distance(image.Sample(linear_sampler, uv + px * float2(1.0, 0.0)).rgb,
+				  background_image.Sample(linear_sampler, uv + px * float2(1.0, 0.0)).rgb);
+	neighbor_diff += distance(image.Sample(linear_sampler, uv + px * float2(-1.0, 0.0)).rgb,
+				  background_image.Sample(linear_sampler, uv + px * float2(-1.0, 0.0)).rgb);
+	neighbor_diff += distance(image.Sample(linear_sampler, uv + px * float2(0.0, 1.0)).rgb,
+				  background_image.Sample(linear_sampler, uv + px * float2(0.0, 1.0)).rgb);
+	neighbor_diff += distance(image.Sample(linear_sampler, uv + px * float2(0.0, -1.0)).rgb,
+				  background_image.Sample(linear_sampler, uv + px * float2(0.0, -1.0)).rgb);
+	mask = max(mask, smoothstep(low * 1.3, high * 1.4, neighbor_diff * 0.25));
+
+	return saturate(mask * has_background);
+}
+
+float4 PSGlassveil(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float2 centered = uv - 0.5;
+	float time = elapsed_time * liquid_speed;
+
+	float flow_a = fbm(uv * 5.2 + float2(time * 0.18, -time * 0.12));
+	float flow_b = fbm(uv * 9.5 + float2(-time * 0.1, time * 0.16));
+	float ripple = sin((uv.y + flow_a * 0.16 + time * 0.08) * 32.0);
+
+	float2 flow = float2(flow_a - 0.5, flow_b - 0.5);
+	float2 lens = normalize(centered + 0.0001) * dot(centered, centered);
+	float2 displacement =
+		(flow * 0.058 + lens * 0.08 + ripple * 0.004) *
+		distortion * glass_amount;
+
+	float2 warped_uv = clamp(uv + displacement, 0.001, 0.999);
+	float2 chromatic_offset = displacement * (0.8 + chromatic_split * 3.4);
+
+	float3 source_color = image.Sample(linear_sampler, uv).rgb;
+	float3 background_color = background_image.Sample(linear_sampler, uv).rgb;
+	float3 glass_color = chromatic_sample(warped_uv, chromatic_offset);
+
+	float edge = sobel_edge(warped_uv);
+	float glint_noise = fbm(uv * 18.0 - float2(time * 0.32, time * 0.21));
+	float glint =
+		smoothstep(0.74, 0.98, glint_noise + edge * 0.38) *
+		highlight_strength;
+
+	float3 edge_tint = float3(0.72, 0.94, 1.0) * edge * edge_glow;
+	float3 highlight = float3(0.9, 1.0, 1.0) * glint;
+	float3 liquid_glass = glass_color + edge_tint + highlight;
+	float3 cloaked_background =
+		background_image.Sample(linear_sampler, warped_uv).rgb +
+		edge_tint * 0.55 + highlight * 0.35;
+
+	float foreground_mask = foreground_difference_mask(uv, source_color);
+	if (debug_mask > 0.5)
+		return float4(lerp(float3(0.0, 0.03, 0.04), float3(0.84, 1.0, 0.92), foreground_mask), 1.0);
+
+	float3 final_color = lerp(source_color, liquid_glass, mix_amount);
+	final_color = lerp(final_color, cloaked_background,
+			   foreground_mask * cloak_amount);
+	final_color = lerp(final_color, background_color,
+			   foreground_mask * cloak_amount * (1.0 - glass_amount) * 0.5);
+
+	float scene_edge_alpha =
+		saturate(foreground_mask * (edge * edge_glow * 0.9 + glint * 0.5));
+	float transparent_cloak_alpha =
+		1.0 - foreground_mask * saturate(scene_through_amount);
+	float output_alpha = lerp(1.0, max(transparent_cloak_alpha, scene_edge_alpha),
+				  saturate(scene_through));
+
+	return float4(final_color, output_alpha);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader = PSGlassveil(v_in);
+	}
+}
