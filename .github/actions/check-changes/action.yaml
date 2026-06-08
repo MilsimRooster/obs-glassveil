@@ -65,6 +65,10 @@ runs:
           esac
         fi
 
+        if ! git cat-file -e "${GIT_BASE_REF}" &> /dev/null; then
+          GIT_BASE_REF='4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+        fi
+
         changes=($(git diff --name-only --diff-filter="${DIFF_FILTER}" ${GIT_BASE_REF} ${GIT_REF} -- ${{ inputs.checkGlob }}))
 
         if (( ${#changes[@]} )); then
